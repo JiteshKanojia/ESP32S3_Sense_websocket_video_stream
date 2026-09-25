@@ -6,12 +6,14 @@
 #include "config.h"
 #include "camera_pins.h"
 
-static const uint32_t FRAME_INTERVAL_MS = 500;
+// Target ~8–10 fps on LAN; raise if posts stay fast and no FB-OVF.
+static const uint32_t FRAME_INTERVAL_MS = 100;
 
 WiFiClient plainClient;
 WiFiClientSecure tlsClient;
 HTTPClient http;
 bool cameraReady = false;
+bool httpIngestOpen = false;
 char ingestURL[128];
 
 bool initCamera() {
@@ -77,7 +79,7 @@ void connectWiFi() {
   Serial.println(WiFi.localIP());
 }
 
-bool postJPEG(uint8_t *data, size_t len) {
+bool openIngestHttp() {
 #if CAM_USE_TLS
   tlsClient.setInsecure();
   if (!http.begin(tlsClient, ingestURL)) {
@@ -88,11 +90,26 @@ bool postJPEG(uint8_t *data, size_t len) {
     return false;
   }
 #endif
+  httpIngestOpen = true;
+  return true;
+}
+
+bool postJPEG(uint8_t *data, size_t len) {
+  if (!httpIngestOpen && !openIngestHttp()) {
+    return false;
+  }
   http.addHeader("Content-Type", "image/jpeg");
   http.addHeader("X-API-Key", INGEST_API_KEY);
+  http.addHeader("Connection", "keep-alive");
   int code = http.POST(data, len);
+  if (code == 204) {
+    return true;
+  }
+#if !CAM_USE_TLS
   http.end();
-  return code == 204;
+  httpIngestOpen = false;
+#endif
+  return false;
 }
 
 void setup() {
@@ -109,6 +126,7 @@ void setup() {
     Serial.println("camera init failed; check OPI PSRAM in Tools");
   }
   connectWiFi();
+  openIngestHttp();
   Serial.println(ingestURL);
 }
 
@@ -123,17 +141,20 @@ void loop() {
     return;
   }
 
-  static uint32_t lastFrame = 0;
+  static uint32_t lastPost = 0;
+  static bool sensorWarmed = false;
   uint32_t now = millis();
-  if ((int32_t)(now - lastFrame) < (int32_t)FRAME_INTERVAL_MS) {
-    delay(20);
+  if ((int32_t)(now - lastPost) < (int32_t)FRAME_INTERVAL_MS) {
+    delay(1);
     return;
   }
 
-  // Drop one stale frame (sensor AE settle), always return buffers.
-  camera_fb_t *stale = esp_camera_fb_get();
-  if (stale) {
-    esp_camera_fb_return(stale);
+  if (!sensorWarmed) {
+    camera_fb_t *stale = esp_camera_fb_get();
+    if (stale) {
+      esp_camera_fb_return(stale);
+    }
+    sensorWarmed = true;
   }
 
   camera_fb_t *fb = esp_camera_fb_get();
@@ -169,10 +190,15 @@ void loop() {
     return;
   }
 
-  lastFrame = now;
+  lastPost = millis();
+
   static uint32_t lastLog = 0;
-  if (now - lastLog > 2000) {
-    lastLog = now;
-    Serial.printf("posted %u bytes\n", (unsigned)frameLen);
+  static uint32_t framesSinceLog = 0;
+  framesSinceLog++;
+  if (millis() - lastLog >= 2000) {
+    float fps = framesSinceLog * 1000.0f / (millis() - lastLog);
+    Serial.printf("%.1f fps, last frame %u bytes\n", fps, (unsigned)frameLen);
+    lastLog = millis();
+    framesSinceLog = 0;
   }
 }
