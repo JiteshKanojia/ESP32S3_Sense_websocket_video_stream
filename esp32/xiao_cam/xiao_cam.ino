@@ -1,20 +1,23 @@
 #include <WiFi.h>
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
+#include <WebSocketsClient.h>
 #include <esp_camera.h>
-#include <esp_heap_caps.h>
 #include "config.h"
 #include "camera_pins.h"
 
-// Target ~8–10 fps on LAN; raise if posts stay fast and no FB-OVF.
-static const uint32_t FRAME_INTERVAL_MS = 100;
+// 1024x768 — FRAMESIZE_XGA. On OV3660 this mode is more reliable than SVGA
+// (see esp32-camera issue #857 for XIAO Sense + OV3660).
+static const framesize_t kFrameSize = FRAMESIZE_XGA;
+// S3 XCLK must divide 80 MHz (20 MHz is a common stable choice).
+static const int kXclkHz = 20000000;
+// XGA JPEGs are often 40–120 KiB; undersized slots cause cam_hal: FB-OVF.
+static const size_t kJpegBufferBytes = 128 * 1024;
+// OV3660/OV2640: lower number = higher quality, larger JPEG (typ. 10–20 for stream).
+static const int kJpegQuality = 17;
 
-WiFiClient plainClient;
-WiFiClientSecure tlsClient;
-HTTPClient http;
+WebSocketsClient webSocket;
 bool cameraReady = false;
-bool httpIngestOpen = false;
-char ingestURL[128];
+bool ingestConnected = false;
+char apiKeyHeader[96];
 
 bool initCamera() {
   camera_config_t config;
@@ -36,13 +39,13 @@ bool initCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 10000000;
+  config.xclk_freq_hz = kXclkHz;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_QVGA;
-  config.jpeg_quality = 12;
+  config.frame_size = kFrameSize;
+  config.jpeg_quality = kJpegQuality;
   config.fb_count = 1;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
-  config.jpeg_buffer_size = 40 * 1024;
+  config.jpeg_buffer_size = kJpegBufferBytes;
 
   if (psramFound()) {
     config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -50,6 +53,7 @@ bool initCamera() {
   } else {
     Serial.println("camera: enable OPI PSRAM in Arduino Tools");
     config.fb_location = CAMERA_FB_IN_DRAM;
+    config.jpeg_buffer_size = 64 * 1024;
   }
 
   if (esp_camera_init(&config) != ESP_OK) {
@@ -57,8 +61,16 @@ bool initCamera() {
     return false;
   }
 
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (sensor) {
+    sensor->set_quality(sensor, kJpegQuality);
+    Serial.printf(
+        "camera sensor PID=0x%04x (OV3660=0x3660)\n",
+        (unsigned)sensor->id.PID);
+  }
+
   cameraReady = true;
-  Serial.println("camera ready");
+  Serial.println("camera ready 1024x768 JPEG");
   return true;
 }
 
@@ -79,125 +91,116 @@ void connectWiFi() {
   Serial.println(WiFi.localIP());
 }
 
-bool openIngestHttp() {
-#if CAM_USE_TLS
-  tlsClient.setInsecure();
-  if (!http.begin(tlsClient, ingestURL)) {
-    return false;
+void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
+  switch (type) {
+  case WStype_DISCONNECTED:
+    ingestConnected = false;
+    Serial.println("ingest disconnected");
+    break;
+  case WStype_CONNECTED:
+    ingestConnected = true;
+    Serial.println("ingest connected");
+    break;
+  default:
+    break;
   }
-#else
-  if (!http.begin(plainClient, ingestURL)) {
-    return false;
-  }
-#endif
-  httpIngestOpen = true;
-  return true;
 }
 
-bool postJPEG(uint8_t *data, size_t len) {
-  if (!httpIngestOpen && !openIngestHttp()) {
-    return false;
-  }
-  http.addHeader("Content-Type", "image/jpeg");
-  http.addHeader("X-API-Key", INGEST_API_KEY);
-  http.addHeader("Connection", "keep-alive");
-  int code = http.POST(data, len);
-  if (code == 204) {
-    return true;
-  }
-#if !CAM_USE_TLS
-  http.end();
-  httpIngestOpen = false;
+void connectIngest() {
+  snprintf(apiKeyHeader, sizeof(apiKeyHeader), "X-API-Key: %s", INGEST_API_KEY);
+  webSocket.setExtraHeaders(apiKeyHeader);
+#if CAM_USE_TLS
+  webSocket.beginSSL(CAM_HOST, 443, CAM_PATH);
+#else
+  webSocket.begin(CAM_HOST, CAM_PORT, CAM_PATH);
 #endif
-  return false;
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(2000);
 }
 
 void setup() {
   Serial.begin(115200);
   delay(500);
-#if CAM_USE_TLS
-  snprintf(ingestURL, sizeof(ingestURL), "https://%s%s", CAM_HOST, CAM_PATH);
-#else
-  snprintf(ingestURL, sizeof(ingestURL), "http://%s:%d%s", CAM_HOST, CAM_PORT, CAM_PATH);
-#endif
 
-  // XIAO ESP32S3: allocate camera DMA before Wi-Fi or init fails with "frame buffer malloc failed".
   if (!initCamera()) {
     Serial.println("camera init failed; check OPI PSRAM in Tools");
   }
   connectWiFi();
-  openIngestHttp();
-  Serial.println(ingestURL);
+  connectIngest();
+
+  camera_fb_t *warm = esp_camera_fb_get();
+  if (warm) {
+    esp_camera_fb_return(warm);
+  }
+
+#if CAM_USE_TLS
+  Serial.printf("wss://%s%s\n", CAM_HOST, CAM_PATH);
+#else
+  Serial.printf("ws://%s:%d%s\n", CAM_HOST, CAM_PORT, CAM_PATH);
+#endif
+}
+
+// OV3660 on XIAO can rarely pack multiple JPEGs in one fb; stream the last one.
+static void jpegView(const uint8_t *buf, size_t len, const uint8_t **out, size_t *outLen) {
+  *out = buf;
+  *outLen = len;
+  if (len < 4) {
+    return;
+  }
+  size_t lastSOI = 0;
+  bool multi = false;
+  for (size_t i = 0; i + 1 < len; i++) {
+    if (buf[i] == 0xFF && buf[i + 1] == 0xD8) {
+      if (i != lastSOI && i > 0) {
+        multi = true;
+      }
+      lastSOI = i;
+    }
+  }
+  if (multi && lastSOI > 0) {
+    *out = buf + lastSOI;
+    *outLen = len - lastSOI;
+  }
 }
 
 void loop() {
+  webSocket.loop();
+
   if (WiFi.status() != WL_CONNECTED) {
     WiFi.reconnect();
     delay(200);
     return;
   }
-  if (!cameraReady) {
-    delay(1000);
+  if (!cameraReady || !ingestConnected) {
     return;
-  }
-
-  static uint32_t lastPost = 0;
-  static bool sensorWarmed = false;
-  uint32_t now = millis();
-  if ((int32_t)(now - lastPost) < (int32_t)FRAME_INTERVAL_MS) {
-    delay(1);
-    return;
-  }
-
-  if (!sensorWarmed) {
-    camera_fb_t *stale = esp_camera_fb_get();
-    if (stale) {
-      esp_camera_fb_return(stale);
-    }
-    sensorWarmed = true;
   }
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
-    Serial.println("camera capture failed");
-    delay(100);
     return;
   }
   if (fb->format != PIXFORMAT_JPEG || fb->len == 0) {
     esp_camera_fb_return(fb);
-    delay(100);
     return;
   }
 
+  const uint8_t *jpeg = fb->buf;
   size_t frameLen = fb->len;
-  uint8_t *copy = (uint8_t *)heap_caps_malloc(frameLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!copy) {
-    copy = (uint8_t *)malloc(frameLen);
-  }
-  if (!copy) {
-    esp_camera_fb_return(fb);
-    Serial.println("no ram for frame copy");
-    return;
-  }
-  memcpy(copy, fb->buf, frameLen);
+  jpegView(fb->buf, fb->len, &jpeg, &frameLen);
+  bool sent = webSocket.sendBIN(jpeg, frameLen);
   esp_camera_fb_return(fb);
-
-  bool ok = postJPEG(copy, frameLen);
-  heap_caps_free(copy);
-  if (!ok) {
-    Serial.println("post failed");
-    delay(200);
+  if (!sent) {
     return;
   }
-
-  lastPost = millis();
 
   static uint32_t lastLog = 0;
   static uint32_t framesSinceLog = 0;
+  static size_t lastBytes = 0;
   framesSinceLog++;
+  lastBytes = frameLen;
   if (millis() - lastLog >= 2000) {
     float fps = framesSinceLog * 1000.0f / (millis() - lastLog);
-    Serial.printf("%.1f fps, last frame %u bytes\n", fps, (unsigned)frameLen);
+    Serial.printf("%.1f fps, %u KB/frame\n", fps, (unsigned)(lastBytes / 1024));
     lastLog = millis();
     framesSinceLog = 0;
   }

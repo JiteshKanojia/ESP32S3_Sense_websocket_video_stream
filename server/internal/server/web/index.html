@@ -57,6 +57,7 @@
   <script>
     const img = document.getElementById("frame");
     const status = document.getElementById("status");
+    let frameUrl;
     async function poll() {
       try {
         const res = await fetch("/frame", { cache: "no-store" });
@@ -69,13 +70,16 @@
           return;
         }
         const blob = await res.blob();
-        img.src = URL.createObjectURL(blob);
+        const url = URL.createObjectURL(blob);
+        if (frameUrl) URL.revokeObjectURL(frameUrl);
+        frameUrl = url;
+        img.src = url;
         status.textContent = "Live";
       } catch (e) {
         status.textContent = "Offline";
       }
     }
-    setInterval(poll, 200);
+    setInterval(poll, 66);
     poll();
   </script>
   {{else}}

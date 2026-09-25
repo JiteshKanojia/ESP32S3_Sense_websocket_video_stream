@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/coder/websocket"
+
 	"camserver/internal/auth"
 	"camserver/internal/config"
 	"camserver/internal/hub"
@@ -40,6 +42,7 @@ func New(cfg config.Config, h *hub.Hub) http.Handler {
 	mux.HandleFunc("POST /logout", s.logout)
 	mux.HandleFunc("GET /frame", s.frame)
 	mux.HandleFunc("POST /ingest", s.ingest)
+	mux.HandleFunc("GET /ingest", s.ingestWS)
 	return mux
 }
 
@@ -124,6 +127,36 @@ func (s *app) ingest(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logIngest("ingest frame %d bytes", len(data))
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *app) ingestWS(w http.ResponseWriter, r *http.Request) {
+	if !auth.SecretOK(r.Header.Get("X-API-Key"), s.cfg.IngestAPIKey) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	conn, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	ctx := r.Context()
+	for {
+		typ, data, err := conn.Read(ctx)
+		if err != nil {
+			return
+		}
+		if typ != websocket.MessageBinary {
+			continue
+		}
+		if len(data) > hub.MaxFrameBytes {
+			continue
+		}
+		if err := s.hub.Publish(data); err != nil {
+			continue
+		}
+		s.logIngest("ingest frame %d bytes", len(data))
+	}
 }
 
 func (s *app) logIngest(format string, n int) {

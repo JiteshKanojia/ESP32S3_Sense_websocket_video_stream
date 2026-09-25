@@ -2,12 +2,16 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/coder/websocket"
 
 	"camserver/internal/auth"
 	"camserver/internal/config"
@@ -167,6 +171,30 @@ func TestIngestReachesFrameEndpoint(t *testing.T) {
 	}
 	if !bytes.Equal(body, frame) {
 		t.Fatalf("frame body %x", body)
+	}
+}
+
+func TestIngestWebSocketReachesFrameEndpoint(t *testing.T) {
+	srv, h := start(t)
+	frame := jpeg()
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/ingest"
+	ctx := context.Background()
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-API-Key": []string{"ingest-key"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	if err := conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for h.Latest() == nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !bytes.Equal(h.Latest(), frame) {
+		t.Fatalf("stored %x", h.Latest())
 	}
 }
 

@@ -7,7 +7,7 @@
 
 // Host only: tunnel hostname or your PC LAN IP. No scheme, no path.
 #define CAM_HOST "your-tunnel.trycloudflare.com"
-#define CAM_PATH "/ingest"  // POST one JPEG per request
+#define CAM_PATH "/ingest"  // WebSocket binary JPEG ingest (HTTP POST also supported)
 // 1 = wss on 443 (Cloudflare). 0 = ws on CAM_PORT (local server on the LAN).
 #define CAM_USE_TLS 1
 #define CAM_PORT 8080

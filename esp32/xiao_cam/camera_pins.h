@@ -1,6 +1,6 @@
 #pragma once
 
-// Seeed XIAO ESP32S3 Sense, OV2640.
+// Seeed XIAO ESP32S3 Sense (OV3660 or OV2640 module; driver auto-detects).
 #define PWDN_GPIO_NUM  -1
 #define RESET_GPIO_NUM -1
 #define XCLK_GPIO_NUM  10
