@@ -58,10 +58,26 @@ inline void camLogWrite(esp_log_level_t level, const char *fmt, ...) {
   esp_log_write(level, CAM_LOG_TAG, "%s\n", buf);
 }
 
+#if CAM_LOG_LEVEL >= ESP_LOG_ERROR
 #define CAM_LOGE(...) camLogWrite(ESP_LOG_ERROR, __VA_ARGS__)
+#else
+#define CAM_LOGE(...) ((void)0)
+#endif
+#if CAM_LOG_LEVEL >= ESP_LOG_WARN
 #define CAM_LOGW(...) camLogWrite(ESP_LOG_WARN, __VA_ARGS__)
+#else
+#define CAM_LOGW(...) ((void)0)
+#endif
+#if CAM_LOG_LEVEL >= ESP_LOG_INFO
 #define CAM_LOGI(...) camLogWrite(ESP_LOG_INFO, __VA_ARGS__)
+#else
+#define CAM_LOGI(...) ((void)0)
+#endif
+#if CAM_LOG_LEVEL >= ESP_LOG_DEBUG
 #define CAM_LOGD(...) camLogWrite(ESP_LOG_DEBUG, __VA_ARGS__)
+#else
+#define CAM_LOGD(...) ((void)0)
+#endif
 
 // Stream stats line (call from loop when your own interval elapses). audioPerSec < 0 omits audio.
 inline void camLogStreamStats(float fps, size_t lastFrameKb, int quality, int audioPerSec) {

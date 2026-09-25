@@ -70,14 +70,17 @@ static void wsLoopLocked() {
   }
 }
 
-static bool wsSendBinLocked(const uint8_t *data, size_t len) {
+// serviceWs: call webSocket.loop() inside lock (audio task). Loop() should pass false after wsLoopLocked().
+static bool wsSendBinLocked(const uint8_t *data, size_t len, bool serviceWs) {
   if (!wsMutex) {
     return false;
   }
   if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(30)) != pdTRUE) {
     return false;
   }
-  webSocket.loop();
+  if (serviceWs) {
+    webSocket.loop();
+  }
   bool ok = webSocket.sendBIN(data, len);
   xSemaphoreGive(wsMutex);
   return ok;
@@ -146,9 +149,7 @@ static void audioStreamTask(void *arg) {
       continue;
     }
     packAudioFrame(packet, pcm, kAudioPcmBytes);
-    uint16_t pcmLen = (uint16_t)packet[4] | ((uint16_t)packet[5] << 8);
-    size_t total = kAudioHeaderBytes + pcmLen;
-    if (wsSendBinLocked(packet, total)) {
+    if (wsSendBinLocked(packet, kAudioPacketBytes, true)) {
 #if CAM_LOOP_LOG
       audioPacketsSent++;
 #endif
@@ -224,9 +225,6 @@ static void applyAntibanding(sensor_t *sensor, int hz, bool log) {
     }
   }
 
-  if (log && sensor->set_framesize) {
-    sensor->set_framesize(sensor, kFrameSize);
-  }
 }
 
 // Vertical banding is usually JPEG blocks, ISP off, or Wi-Fi EMI on DVP — not 50 Hz mains.
@@ -378,7 +376,7 @@ bool initCamera() {
     CAM_LOGI("camera sensor PID=0x%04x (OV3660=0x3660)", (unsigned)sensor->id.PID);
     applyImageTuning(sensor);
     applyOrientation(sensor);
-    applyAntibanding(sensor, runtimeAntibanding, true);
+    applyAntibanding(sensor, runtimeAntibanding, false);
   }
 
   sendBufCap = kJpegBufferBytes;
@@ -470,23 +468,20 @@ void setup() {
 #endif
 }
 
+// OV3660 can emit multiple JPEG SOIs in one fb; keep the last scan (rare path).
 static void jpegView(const uint8_t *buf, size_t len, const uint8_t **out, size_t *outLen) {
   *out = buf;
   *outLen = len;
-  if (len < 4) {
+  if (len < 4 || buf[0] != 0xFF || buf[1] != 0xD8) {
     return;
   }
   size_t lastSOI = 0;
-  bool multi = false;
   for (size_t i = 0; i + 1 < len; i++) {
     if (buf[i] == 0xFF && buf[i + 1] == 0xD8) {
-      if (i != lastSOI && i > 0) {
-        multi = true;
-      }
       lastSOI = i;
     }
   }
-  if (multi && lastSOI > 0) {
+  if (lastSOI > 0) {
     *out = buf + lastSOI;
     *outLen = len - lastSOI;
   }
@@ -535,7 +530,7 @@ void loop() {
   esp_camera_fb_return(fb);
 
 #if CAM_AUDIO_ENABLE
-  if (!wsSendBinLocked(sendBuf, frameLen)) {
+  if (!wsSendBinLocked(sendBuf, frameLen, false)) {
     return;
   }
 #else
