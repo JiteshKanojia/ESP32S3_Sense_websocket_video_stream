@@ -3,3 +3,4 @@ server/camserver
 server/camserver.exe
 *.exe
 *.env
+.cursor/
