@@ -27,8 +27,10 @@
       display: flex;
       gap: 8px;
       align-items: center;
+      flex-wrap: wrap;
+      justify-content: center;
     }
-    input, button {
+    input, button, select {
       font: inherit;
       padding: 8px 12px;
       border-radius: 6px;
@@ -40,17 +42,61 @@
     .error { color: #f88; margin: 0; }
     img {
       max-width: 100%;
-      max-height: calc(100vh - 80px);
+      max-height: calc(100vh - 200px);
       background: #000;
     }
     .status { color: #aaa; margin: 0; }
+    .controls {
+      display: grid;
+      gap: 8px 12px;
+      grid-template-columns: auto 1fr auto;
+      align-items: center;
+      max-width: 420px;
+      width: 100%;
+      font-size: 14px;
+    }
+    .controls input[type="range"] { width: 100%; }
+    .controls label { color: #bbb; }
   </style>
 </head>
 <body>
 <main>
   {{if .LoggedIn}}
   <img id="frame" alt="camera frame">
-  <p class="status" id="status">Waiting for frames…</p>
+  <p class="status" id="status">Connecting…</p>
+  <details open>
+    <summary>Camera tuning</summary>
+    <div class="controls" id="controls">
+      <label for="quality">JPEG quality</label>
+      <input type="range" id="quality" min="10" max="30" value="26">
+      <span id="qualityVal">26</span>
+      <label for="antibanding">Anti-banding</label>
+      <select id="antibanding">
+        <option value="0">Off</option>
+        <option value="50" selected>50 Hz</option>
+        <option value="60">60 Hz</option>
+      </select>
+      <span></span>
+      <label for="denoise">Denoise</label>
+      <input type="range" id="denoise" min="0" max="8" value="3">
+      <span id="denoiseVal">3</span>
+      <label for="lenc">Lens correction</label>
+      <select id="lenc">
+        <option value="0">Off</option>
+        <option value="1" selected>On</option>
+      </select>
+      <span></span>
+      <label for="sharpness">Sharpness</label>
+      <input type="range" id="sharpness" min="-3" max="3" value="-2">
+      <span id="sharpnessVal">-2</span>
+      <label for="vflip">Vertical flip</label>
+      <input type="checkbox" id="vflip">
+      <span></span>
+      <label for="hmirror">Horizontal mirror</label>
+      <input type="checkbox" id="hmirror">
+      <span></span>
+    </div>
+  </details>
   <form method="post" action="/logout" class="bar">
     <button type="submit">Log out</button>
   </form>
@@ -58,29 +104,122 @@
     const img = document.getElementById("frame");
     const status = document.getElementById("status");
     let frameUrl;
-    async function poll() {
-      try {
-        const res = await fetch("/frame", { cache: "no-store" });
-        if (res.status === 204) {
-          status.textContent = "Waiting for frames…";
-          return;
-        }
-        if (!res.ok) {
-          status.textContent = "Error " + res.status;
-          return;
-        }
-        const blob = await res.blob();
+    let ws;
+    let frames = 0;
+    let fpsSince = performance.now();
+
+    function setFpsLabel(prefix) {
+      const elapsed = (performance.now() - fpsSince) / 1000;
+      if (elapsed < 0.5) return;
+      const fps = (frames / elapsed).toFixed(1);
+      frames = 0;
+      fpsSince = performance.now();
+      status.textContent = prefix + " · " + fps + " fps";
+    }
+
+    function connectWatch() {
+      const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+      ws = new WebSocket(scheme + "//" + location.host + "/watch");
+      ws.binaryType = "arraybuffer";
+      ws.onopen = () => {
+        status.textContent = "Live";
+        fpsSince = performance.now();
+        frames = 0;
+      };
+      ws.onclose = () => {
+        status.textContent = "Reconnecting…";
+        setTimeout(connectWatch, 1000);
+      };
+      ws.onerror = () => ws.close();
+      ws.onmessage = (ev) => {
+        const blob = new Blob([ev.data], { type: "image/jpeg" });
         const url = URL.createObjectURL(blob);
         if (frameUrl) URL.revokeObjectURL(frameUrl);
         frameUrl = url;
         img.src = url;
-        status.textContent = "Live";
+        frames++;
+        setFpsLabel("Live");
+      };
+    }
+    connectWatch();
+
+    const quality = document.getElementById("quality");
+    const qualityVal = document.getElementById("qualityVal");
+    const denoise = document.getElementById("denoise");
+    const denoiseVal = document.getElementById("denoiseVal");
+    const sharpness = document.getElementById("sharpness");
+    const sharpnessVal = document.getElementById("sharpnessVal");
+    const antibanding = document.getElementById("antibanding");
+    const lenc = document.getElementById("lenc");
+    const vflip = document.getElementById("vflip");
+    const hmirror = document.getElementById("hmirror");
+
+    let pushTimer;
+    function schedulePush() {
+      clearTimeout(pushTimer);
+      pushTimer = setTimeout(pushSettings, 350);
+    }
+
+    function currentPatch() {
+      return {
+        quality: Number(quality.value),
+        antibanding: Number(antibanding.value),
+        denoise: Number(denoise.value),
+        lenc: Number(lenc.value),
+        sharpness: Number(sharpness.value),
+        vflip: vflip.checked ? 1 : 0,
+        hmirror: hmirror.checked ? 1 : 0,
+      };
+    }
+
+    async function pushSettings() {
+      try {
+        await fetch("/camera/settings", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(currentPatch()),
+        });
       } catch (e) {
-        status.textContent = "Offline";
+        console.warn("settings push failed", e);
       }
     }
-    setInterval(poll, 66);
-    poll();
+
+    function bindRange(input, label) {
+      input.addEventListener("input", () => {
+        label.textContent = input.value;
+        schedulePush();
+      });
+    }
+    bindRange(quality, qualityVal);
+    bindRange(denoise, denoiseVal);
+    bindRange(sharpness, sharpnessVal);
+    antibanding.addEventListener("change", schedulePush);
+    lenc.addEventListener("change", schedulePush);
+    vflip.addEventListener("change", schedulePush);
+    hmirror.addEventListener("change", schedulePush);
+
+    fetch("/camera/settings")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((s) => {
+        if (!s) return;
+        if (s.quality != null) {
+          quality.value = s.quality;
+          qualityVal.textContent = s.quality;
+        }
+        if (s.antibanding != null) antibanding.value = String(s.antibanding);
+        if (s.denoise != null) {
+          denoise.value = s.denoise;
+          denoiseVal.textContent = s.denoise;
+        }
+        if (s.lenc != null) lenc.value = String(s.lenc);
+        if (s.sharpness != null) {
+          sharpness.value = s.sharpness;
+          sharpnessVal.textContent = s.sharpness;
+        }
+        if (s.vflip != null) vflip.checked = s.vflip !== 0;
+        if (s.hmirror != null) hmirror.checked = s.hmirror !== 0;
+      })
+      .catch(() => {});
   </script>
   {{else}}
   <h1>Camera</h1>

@@ -48,3 +48,18 @@ func TestPublishReplacesPrevious(t *testing.T) {
 		t.Fatalf("latest %x", h.Latest())
 	}
 }
+
+func TestSubscribeReceivesPublish(t *testing.T) {
+	h := New()
+	ch := h.Subscribe()
+	defer h.Unsubscribe(ch)
+
+	want := jpeg(7)
+	if err := h.Publish(want); err != nil {
+		t.Fatal(err)
+	}
+	got := <-ch
+	if !bytes.Equal(got, want) {
+		t.Fatalf("notify %x", got)
+	}
+}

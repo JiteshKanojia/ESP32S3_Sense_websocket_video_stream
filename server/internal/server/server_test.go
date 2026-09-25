@@ -198,6 +198,70 @@ func TestIngestWebSocketReachesFrameEndpoint(t *testing.T) {
 	}
 }
 
+func TestCameraSettingsRequiresLogin(t *testing.T) {
+	srv, _ := start(t)
+	resp, err := http.Get(srv.URL + "/camera/settings")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+}
+
+func TestWatchRequiresLogin(t *testing.T) {
+	srv, _ := start(t)
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/watch"
+	ctx := context.Background()
+	_, resp, err := websocket.Dial(ctx, wsURL, nil)
+	if err == nil {
+		t.Fatal("expected dial error")
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status %v", resp)
+	}
+}
+
+func TestWatchWebSocketReceivesIngest(t *testing.T) {
+	srv, _ := start(t)
+	frame := jpeg()
+	c := loggedInCookie(t, login(t, srv, "secret-pass", nil))
+
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/watch"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	watch, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{
+			"Cookie": []string{c.Name + "=" + c.Value},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer watch.Close(websocket.StatusNormalClosure, "")
+
+	resp := postJPEG(t, srv.URL+"/ingest", frame, http.Header{"X-API-Key": []string{"ingest-key"}})
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("ingest %d", resp.StatusCode)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		typ, data, err := watch.Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if typ == websocket.MessageBinary && bytes.Equal(data, frame) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timeout waiting for watch frame")
+		}
+	}
+}
+
 func TestOversizedIngestRejected(t *testing.T) {
 	srv, h := start(t)
 	big := make([]byte, hub.MaxFrameBytes+1)

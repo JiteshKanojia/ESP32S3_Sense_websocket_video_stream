@@ -2,6 +2,7 @@ package server
 
 import (
 	_ "embed"
+	"encoding/json"
 	"html/template"
 	"io"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"github.com/coder/websocket"
 
 	"camserver/internal/auth"
+	"camserver/internal/cameractl"
 	"camserver/internal/config"
 	"camserver/internal/hub"
 )
@@ -31,16 +33,20 @@ type pageData struct {
 // New returns the HTTP handler for login, viewing, and camera ingest.
 func New(cfg config.Config, h *hub.Hub) http.Handler {
 	s := &app{
-		cfg:   cfg,
-		hub:   h,
-		limit: auth.NewLimiter(loginAttempts, time.Minute),
-		tmpl:  template.Must(template.New("page").Parse(pageHTML)),
+		cfg:    cfg,
+		hub:    h,
+		camera: cameractl.New(),
+		limit:  auth.NewLimiter(loginAttempts, time.Minute),
+		tmpl:   template.Must(template.New("page").Parse(pageHTML)),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.home)
 	mux.HandleFunc("POST /login", s.login)
 	mux.HandleFunc("POST /logout", s.logout)
 	mux.HandleFunc("GET /frame", s.frame)
+	mux.HandleFunc("GET /watch", s.watchWS)
+	mux.HandleFunc("GET /camera/settings", s.cameraSettingsGet)
+	mux.HandleFunc("PATCH /camera/settings", s.cameraSettingsPatch)
 	mux.HandleFunc("POST /ingest", s.ingest)
 	mux.HandleFunc("GET /ingest", s.ingestWS)
 	return mux
@@ -49,6 +55,7 @@ func New(cfg config.Config, h *hub.Hub) http.Handler {
 type app struct {
 	cfg          config.Config
 	hub          *hub.Hub
+	camera       *cameractl.Camera
 	limit        *auth.Limiter
 	tmpl         *template.Template
 	logMu        sync.Mutex
@@ -129,6 +136,78 @@ func (s *app) ingest(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *app) watchWS(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	conn, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	ctx := r.Context()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			if _, _, err := conn.Read(ctx); err != nil {
+				return
+			}
+		}
+	}()
+
+	ch := s.hub.Subscribe()
+	defer s.hub.Unsubscribe(ch)
+
+	if frame := s.hub.Latest(); frame != nil {
+		if err := conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
+			return
+		}
+	}
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		case frame := <-ch:
+			if err := conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (s *app) cameraSettingsGet(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.camera.Snapshot())
+}
+
+func (s *app) cameraSettingsPatch(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<10)
+	var patch cameractl.Settings
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if _, err := s.camera.Merge(patch); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *app) ingestWS(w http.ResponseWriter, r *http.Request) {
 	if !auth.SecretOK(r.Header.Get("X-API-Key"), s.cfg.IngestAPIKey) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -139,6 +218,8 @@ func (s *app) ingestWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
+	s.camera.SetConn(conn)
+	defer s.camera.ClearConn(conn)
 
 	ctx := r.Context()
 	for {
