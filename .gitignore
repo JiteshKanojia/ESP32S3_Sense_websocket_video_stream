@@ -1,0 +1,5 @@
+esp32/xiao_cam/config.h
+server/camserver
+server/camserver.exe
+*.exe
+*.env

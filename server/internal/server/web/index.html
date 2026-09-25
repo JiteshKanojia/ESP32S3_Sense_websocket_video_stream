@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Camera</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #111;
+      color: #eee;
+      font: 16px/1.4 system-ui, sans-serif;
+    }
+    main {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      padding: 16px;
+      box-sizing: border-box;
+    }
+    form, .bar {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    input, button {
+      font: inherit;
+      padding: 8px 12px;
+      border-radius: 6px;
+      border: 1px solid #444;
+      background: #1c1c1c;
+      color: inherit;
+    }
+    button { cursor: pointer; }
+    .error { color: #f88; margin: 0; }
+    img {
+      max-width: 100%;
+      max-height: calc(100vh - 80px);
+      background: #000;
+    }
+    .status { color: #aaa; margin: 0; }
+  </style>
+</head>
+<body>
+<main>
+  {{if .LoggedIn}}
+  <img id="frame" alt="camera frame">
+  <p class="status" id="status">Waiting for frames…</p>
+  <form method="post" action="/logout" class="bar">
+    <button type="submit">Log out</button>
+  </form>
+  <script>
+    const img = document.getElementById("frame");
+    const status = document.getElementById("status");
+    async function poll() {
+      try {
+        const res = await fetch("/frame", { cache: "no-store" });
+        if (res.status === 204) {
+          status.textContent = "Waiting for frames…";
+          return;
+        }
+        if (!res.ok) {
+          status.textContent = "Error " + res.status;
+          return;
+        }
+        const blob = await res.blob();
+        img.src = URL.createObjectURL(blob);
+        status.textContent = "Live";
+      } catch (e) {
+        status.textContent = "Offline";
+      }
+    }
+    setInterval(poll, 200);
+    poll();
+  </script>
+  {{else}}
+  <h1>Camera</h1>
+  {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+  <form method="post" action="/login">
+    <input type="password" name="password" autocomplete="current-password" required autofocus>
+    <button type="submit">Log in</button>
+  </form>
+  {{end}}
+</main>
+</body>
+</html>
