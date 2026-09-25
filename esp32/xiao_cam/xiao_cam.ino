@@ -13,7 +13,7 @@
 #if CAM_AUDIO_ENABLE
 #include "ESP_I2S.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #endif
 
@@ -52,6 +52,37 @@ static char settingsJson[280];
 WebSocketsClient webSocket;
 bool cameraReady = false;
 bool ingestConnected = false;
+
+#if CAM_AUDIO_ENABLE
+#ifndef CAM_AUDIO_CORE
+#define CAM_AUDIO_CORE 0
+#endif
+static SemaphoreHandle_t wsMutex = nullptr;
+
+static void wsLoopLocked() {
+  if (!wsMutex) {
+    webSocket.loop();
+    return;
+  }
+  if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(3)) == pdTRUE) {
+    webSocket.loop();
+    xSemaphoreGive(wsMutex);
+  }
+}
+
+static bool wsSendBinLocked(const uint8_t *data, size_t len) {
+  if (!wsMutex) {
+    return false;
+  }
+  if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(30)) != pdTRUE) {
+    return false;
+  }
+  webSocket.loop();
+  bool ok = webSocket.sendBIN(data, len);
+  xSemaphoreGive(wsMutex);
+  return ok;
+}
+#endif
 char apiKeyHeader[96];
 uint8_t *sendBuf = nullptr;
 size_t sendBufCap = 0;
@@ -66,7 +97,6 @@ static const int kPdmClkPin = 42;
 static const int kPdmDataPin = 41;
 
 static I2SClass audioI2s;
-static QueueHandle_t audioQueue = nullptr;
 static volatile bool audioReady = false;
 static uint32_t audioPacketsSent = 0;
 
@@ -100,69 +130,51 @@ static bool readPcmBlock(uint8_t *pcm, size_t bytes) {
   return gotSamples == needSamples;
 }
 
-static void audioTask(void *arg) {
+// PDM capture + ingest send on CAM_AUDIO_CORE (Arduino loop/camera stays on the other core).
+static void audioStreamTask(void *arg) {
   uint8_t pcm[kAudioPcmBytes];
   uint8_t packet[kAudioPacketBytes];
   for (;;) {
+    if (!audioReady || !ingestConnected) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
     if (!readPcmBlock(pcm, kAudioPcmBytes)) {
-      vTaskDelay(10);
+      vTaskDelay(1);
       continue;
     }
     packAudioFrame(packet, pcm, kAudioPcmBytes);
-    if (xQueueSend(audioQueue, packet, 0) != pdTRUE) {
-      uint8_t drop[kAudioPacketBytes];
-      xQueueReceive(audioQueue, drop, 0);
-      xQueueSend(audioQueue, packet, 0);
+    uint16_t pcmLen = (uint16_t)packet[4] | ((uint16_t)packet[5] << 8);
+    size_t total = kAudioHeaderBytes + pcmLen;
+    if (wsSendBinLocked(packet, total)) {
+#if CAM_LOOP_LOG
+      audioPacketsSent++;
+#endif
     }
+    taskYIELD();
   }
 }
 
 static bool initAudio() {
+  if (!wsMutex) {
+    wsMutex = xSemaphoreCreateMutex();
+    if (!wsMutex) {
+      CAM_LOGE("audio: ws mutex alloc failed");
+      return false;
+    }
+  }
   audioI2s.setPinsPdmRx(kPdmClkPin, kPdmDataPin);
   if (!audioI2s.begin(I2S_MODE_PDM_RX, kAudioSampleRate, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
     CAM_LOGE("audio: PDM init failed (Sense hat? pins 42=CLK 41=DATA)");
     return false;
   }
   delay(50);
-  audioQueue = xQueueCreate(3, kAudioPacketBytes);
-  if (!audioQueue) {
-    CAM_LOGE("audio: queue alloc failed");
-    return false;
-  }
-  if (xTaskCreatePinnedToCore(audioTask, "audio", 4096, nullptr, 1, nullptr, 0) != pdPASS) {
+  if (xTaskCreatePinnedToCore(audioStreamTask, "audio", 6144, nullptr, 2, nullptr, CAM_AUDIO_CORE) != pdPASS) {
     CAM_LOGE("audio: task create failed");
     return false;
   }
   audioReady = true;
-  CAM_LOGI("audio: PDM %d Hz mono (CLK=%d DATA=%d)", kAudioSampleRate, kPdmClkPin, kPdmDataPin);
-  return true;
-}
-
-static void flushAudioQueue() {
-  if (!audioQueue) {
-    return;
-  }
-  uint8_t drop[kAudioPacketBytes];
-  while (xQueueReceive(audioQueue, drop, 0) == pdTRUE) {
-  }
-}
-
-static bool sendOneAudioPacket() {
-  if (!audioReady || !audioQueue || !ingestConnected) {
-    return false;
-  }
-  uint8_t packet[kAudioPacketBytes];
-  if (xQueueReceive(audioQueue, packet, 0) != pdTRUE) {
-    return false;
-  }
-  uint16_t pcmLen = (uint16_t)packet[4] | ((uint16_t)packet[5] << 8);
-  size_t total = kAudioHeaderBytes + pcmLen;
-  if (!webSocket.sendBIN(packet, total)) {
-    return false;
-  }
-#if CAM_LOOP_LOG
-  audioPacketsSent++;
-#endif
+  CAM_LOGI("audio: PDM %d Hz on core %d (camera on other core)", kAudioSampleRate, CAM_AUDIO_CORE);
   return true;
 }
 #endif
@@ -398,9 +410,6 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
   switch (type) {
   case WStype_DISCONNECTED:
     ingestConnected = false;
-#if CAM_AUDIO_ENABLE
-    flushAudioQueue();
-#endif
     CAM_LOGI("ingest disconnected");
     break;
   case WStype_CONNECTED:
@@ -481,29 +490,18 @@ static void jpegView(const uint8_t *buf, size_t len, const uint8_t **out, size_t
   }
 }
 
-#if CAM_AUDIO_ENABLE
-static void pumpAudioOut(int maxPackets) {
-  for (int i = 0; i < maxPackets && ingestConnected; i++) {
-    if (!sendOneAudioPacket()) {
-      break;
-    }
-    webSocket.loop();
-  }
-}
-#endif
-
 void loop() {
+#if CAM_AUDIO_ENABLE
+  wsLoopLocked();
+#else
   webSocket.loop();
+#endif
 
   if (WiFi.status() != WL_CONNECTED) {
     WiFi.reconnect();
     delay(200);
     return;
   }
-
-#if CAM_AUDIO_ENABLE
-  pumpAudioOut(8);
-#endif
 
   if (!cameraReady || !ingestConnected || !sendBuf) {
     return;
@@ -534,12 +532,14 @@ void loop() {
   memcpy(sendBuf, jpeg, frameLen);
   esp_camera_fb_return(fb);
 
+#if CAM_AUDIO_ENABLE
+  if (!wsSendBinLocked(sendBuf, frameLen)) {
+    return;
+  }
+#else
   if (!webSocket.sendBIN(sendBuf, frameLen)) {
     return;
   }
-
-#if CAM_AUDIO_ENABLE
-  pumpAudioOut(12);
 #endif
 
 #if CAM_LOOP_LOG
@@ -555,16 +555,12 @@ void loop() {
   if (elapsed >= (uint32_t)CAM_STATS_INTERVAL_MS) {
     float fps = framesSinceStats * 1000.0f / (float)elapsed;
 #if CAM_AUDIO_ENABLE
-    pumpAudioOut(4);
     int audioPs = (int)(audioPacketsSent * 1000 / (elapsed ? elapsed : 1));
     audioPacketsSent = 0;
 #else
     int audioPs = -1;
 #endif
     camLogStreamStats(fps, lastBytes / 1024, runtimeQuality, audioPs);
-#if CAM_AUDIO_ENABLE
-    pumpAudioOut(4);
-#endif
     framesSinceStats = 0;
     statsSinceMs = millis();
   }

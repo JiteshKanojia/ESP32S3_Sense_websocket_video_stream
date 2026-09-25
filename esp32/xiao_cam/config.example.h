@@ -30,6 +30,11 @@
 #define CAM_AUDIO_ENABLE 1
 #endif
 
+// FreeRTOS core for audioStreamTask (0 or 1). Arduino loop + camera use the other core.
+#ifndef CAM_AUDIO_CORE
+#define CAM_AUDIO_CORE 0
+#endif
+
 // Logging via esp_log (still USB serial). ESP_LOG_INFO, ESP_LOG_WARN, ESP_LOG_DEBUG, ESP_LOG_NONE
 // #define CAM_LOG_LEVEL ESP_LOG_INFO
 

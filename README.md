@@ -81,7 +81,7 @@ The **Sense expansion board** onboard PDM mic uses **GPIO42 = CLK** and **GPIO41
 
 The mic sends **PCM 16-bit mono @ 16 kHz** in ~20 ms chunks (~32 KB/s). Wire format per message: `0xA1`, format `0x01`, sample rate (LE `uint16`), payload length (LE `uint16`), then PCM bytes. Set **`CAM_AUDIO_ENABLE`** to `0` in `config.h` to disable mic capture and compare video fps. If samples are stuck, try a full flash erase (known ESP32 Arduino 3.x quirk).
 
-With audio enabled, capture runs on a **separate FreeRTOS task**; expect about **0–2 fps** video drop on LAN versus audio off, mainly from extra Wi-Fi packets—not from JPEG size.
+With audio enabled, **PDM capture and audio WebSocket sends** run on **`audioStreamTask`** (core **`CAM_AUDIO_CORE`**, default 0); **camera + JPEG** stay on the Arduino `loop()` core. A mutex serializes `sendBIN` so the two paths do not stomp the same socket. Keep **`CAM_LOOP_LOG 0`** while testing audio. Expect about **0–2 fps** video drop versus audio off, mainly from Wi-Fi airtime—not JPEG size.
 
 ### Frame rate (theory vs this project)
 
