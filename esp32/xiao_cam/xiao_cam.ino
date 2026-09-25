@@ -98,7 +98,9 @@ static const int kPdmDataPin = 41;
 
 static I2SClass audioI2s;
 static volatile bool audioReady = false;
+#if CAM_LOOP_LOG
 static uint32_t audioPacketsSent = 0;
+#endif
 
 static void packAudioFrame(uint8_t *out, const uint8_t *pcm, size_t pcmLen) {
   out[0] = 0xA1;
