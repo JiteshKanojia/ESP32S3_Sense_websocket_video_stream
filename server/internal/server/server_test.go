@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"camserver/internal/audi"
 	"camserver/internal/auth"
 	"camserver/internal/config"
 	"camserver/internal/hub"
@@ -26,12 +28,13 @@ func testConfig() config.Config {
 	}
 }
 
-func start(t *testing.T) (*httptest.Server, *hub.Hub) {
+func start(t *testing.T) (*httptest.Server, *hub.Hub, *audi.Hub) {
 	t.Helper()
-	h := hub.New()
-	srv := httptest.NewServer(New(testConfig(), h))
+	vh := hub.New()
+	ah := audi.New()
+	srv := httptest.NewServer(New(testConfig(), vh, ah))
 	t.Cleanup(srv.Close)
-	return srv, h
+	return srv, vh, ah
 }
 
 func noRedirect(t *testing.T) *http.Client {
@@ -108,8 +111,18 @@ func jpeg() []byte {
 	return []byte{0xFF, 0xD8, 0x11, 0xFF, 0xD9}
 }
 
+func pcmFrame(pcm []byte) []byte {
+	out := make([]byte, audi.HeaderSize+len(pcm))
+	out[0] = audi.Magic
+	out[1] = audi.FormatPCM16Mono
+	binary.LittleEndian.PutUint16(out[2:4], 16000)
+	binary.LittleEndian.PutUint16(out[4:6], uint16(len(pcm)))
+	copy(out[audi.HeaderSize:], pcm)
+	return out
+}
+
 func TestLoginRejectsBadPassword(t *testing.T) {
-	srv, _ := start(t)
+	srv, _, _ := start(t)
 	resp := login(t, srv, "nope", nil)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status %d", resp.StatusCode)
@@ -117,7 +130,7 @@ func TestLoginRejectsBadPassword(t *testing.T) {
 }
 
 func TestFrameRequiresLogin(t *testing.T) {
-	srv, _ := start(t)
+	srv, _, _ := start(t)
 	resp, err := http.Get(srv.URL + "/frame")
 	if err != nil {
 		t.Fatal(err)
@@ -129,7 +142,7 @@ func TestFrameRequiresLogin(t *testing.T) {
 }
 
 func TestIngestRequiresAPIKey(t *testing.T) {
-	srv, _ := start(t)
+	srv, _, _ := start(t)
 	resp := postJPEG(t, srv.URL+"/ingest", jpeg(), nil)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("missing key: %d", resp.StatusCode)
@@ -141,7 +154,7 @@ func TestIngestRequiresAPIKey(t *testing.T) {
 }
 
 func TestIngestReachesFrameEndpoint(t *testing.T) {
-	srv, h := start(t)
+	srv, h, _ := start(t)
 	frame := jpeg()
 	resp := postJPEG(t, srv.URL+"/ingest", frame, http.Header{"X-API-Key": []string{"ingest-key"}})
 	if resp.StatusCode != http.StatusNoContent {
@@ -175,7 +188,7 @@ func TestIngestReachesFrameEndpoint(t *testing.T) {
 }
 
 func TestIngestWebSocketReachesFrameEndpoint(t *testing.T) {
-	srv, h := start(t)
+	srv, h, _ := start(t)
 	frame := jpeg()
 	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/ingest"
 	ctx := context.Background()
@@ -199,7 +212,7 @@ func TestIngestWebSocketReachesFrameEndpoint(t *testing.T) {
 }
 
 func TestCameraSettingsRequiresLogin(t *testing.T) {
-	srv, _ := start(t)
+	srv, _, _ := start(t)
 	resp, err := http.Get(srv.URL + "/camera/settings")
 	if err != nil {
 		t.Fatal(err)
@@ -211,7 +224,7 @@ func TestCameraSettingsRequiresLogin(t *testing.T) {
 }
 
 func TestWatchRequiresLogin(t *testing.T) {
-	srv, _ := start(t)
+	srv, _, _ := start(t)
 	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/watch"
 	ctx := context.Background()
 	_, resp, err := websocket.Dial(ctx, wsURL, nil)
@@ -224,7 +237,7 @@ func TestWatchRequiresLogin(t *testing.T) {
 }
 
 func TestWatchWebSocketReceivesIngest(t *testing.T) {
-	srv, _ := start(t)
+	srv, _, _ := start(t)
 	frame := jpeg()
 	c := loggedInCookie(t, login(t, srv, "secret-pass", nil))
 
@@ -262,8 +275,101 @@ func TestWatchWebSocketReceivesIngest(t *testing.T) {
 	}
 }
 
+func TestIngestWebSocketAudioDemux(t *testing.T) {
+	srv, vh, ah := start(t)
+	frame := jpeg()
+	audio := pcmFrame([]byte{0, 0, 1, 0})
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/ingest"
+	ctx := context.Background()
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-API-Key": []string{"ingest-key"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	if err := conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Write(ctx, websocket.MessageBinary, audio); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if vh.Latest() != nil && ah.Latest() != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !bytes.Equal(vh.Latest(), frame) {
+		t.Fatalf("video %x", vh.Latest())
+	}
+	if !bytes.Equal(ah.Latest(), audio) {
+		t.Fatalf("audio %x", ah.Latest())
+	}
+}
+
+func TestListenRequiresLogin(t *testing.T) {
+	srv, _, _ := start(t)
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/listen"
+	ctx := context.Background()
+	_, resp, err := websocket.Dial(ctx, wsURL, nil)
+	if err == nil {
+		t.Fatal("expected dial error")
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status %v", resp)
+	}
+}
+
+func TestListenWebSocketReceivesIngest(t *testing.T) {
+	srv, _, _ := start(t)
+	audio := pcmFrame([]byte{0, 0, 2, 0})
+	c := loggedInCookie(t, login(t, srv, "secret-pass", nil))
+
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/listen"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	listen, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{
+			"Cookie": []string{c.Name + "=" + c.Value},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listen.Close(websocket.StatusNormalClosure, "")
+
+	ingestURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/ingest"
+	ingest, _, err := websocket.Dial(ctx, ingestURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-API-Key": []string{"ingest-key"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ingest.Close(websocket.StatusNormalClosure, "")
+	if err := ingest.Write(ctx, websocket.MessageBinary, audio); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		typ, data, err := listen.Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if typ == websocket.MessageBinary && bytes.Equal(data, audio) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timeout waiting for listen audio")
+		}
+	}
+}
+
 func TestOversizedIngestRejected(t *testing.T) {
-	srv, h := start(t)
+	srv, h, _ := start(t)
 	big := make([]byte, hub.MaxFrameBytes+1)
 	big[0], big[1] = 0xFF, 0xD8
 	resp := postJPEG(t, srv.URL+"/ingest", big, http.Header{"X-API-Key": []string{"ingest-key"}})

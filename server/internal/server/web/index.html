@@ -40,10 +40,12 @@
     }
     button { cursor: pointer; }
     .error { color: #f88; margin: 0; }
-    img {
+    canvas#frame {
       max-width: 100%;
       max-height: calc(100vh - 200px);
       background: #000;
+      width: auto;
+      height: auto;
     }
     .status { color: #aaa; margin: 0; }
     .controls {
@@ -62,8 +64,13 @@
 <body>
 <main>
   {{if .LoggedIn}}
-  <img id="frame" alt="camera frame">
+  <canvas id="frame" width="1024" height="768"></canvas>
   <p class="status" id="status">Connecting…</p>
+  <p class="bar">
+    <button type="button" id="audioStart">Enable audio</button>
+    <label><input type="checkbox" id="audioMute"> Mute</label>
+    <span class="status" id="audioStatus">Audio off</span>
+  </p>
   <details open>
     <summary>Camera tuning</summary>
     <div class="controls" id="controls">
@@ -101,10 +108,12 @@
     <button type="submit">Log out</button>
   </form>
   <script>
-    const img = document.getElementById("frame");
+    const canvas = document.getElementById("frame");
+    const ctx = canvas.getContext("2d", { alpha: false });
     const status = document.getElementById("status");
-    let frameUrl;
-    let ws;
+    let watchWs;
+    let latestJpeg = null;
+    let painting = false;
     let frames = 0;
     let fpsSince = performance.now();
 
@@ -117,31 +126,198 @@
       status.textContent = prefix + " · " + fps + " fps";
     }
 
+    function paintLoop() {
+      requestAnimationFrame(paintLoop);
+      if (painting || !latestJpeg) return;
+      const data = latestJpeg;
+      latestJpeg = null;
+      painting = true;
+      createImageBitmap(new Blob([data], { type: "image/jpeg" }))
+        .then((bmp) => {
+          if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
+            canvas.width = bmp.width;
+            canvas.height = bmp.height;
+          }
+          ctx.drawImage(bmp, 0, 0);
+          bmp.close();
+          frames++;
+          setFpsLabel("Live");
+        })
+        .catch(() => {})
+        .finally(() => {
+          painting = false;
+        });
+    }
+
     function connectWatch() {
+      if (watchWs) {
+        watchWs.onclose = null;
+        watchWs.close();
+      }
       const scheme = location.protocol === "https:" ? "wss:" : "ws:";
-      ws = new WebSocket(scheme + "//" + location.host + "/watch");
-      ws.binaryType = "arraybuffer";
-      ws.onopen = () => {
+      watchWs = new WebSocket(scheme + "//" + location.host + "/watch");
+      watchWs.binaryType = "arraybuffer";
+      watchWs.onopen = () => {
         status.textContent = "Live";
         fpsSince = performance.now();
         frames = 0;
       };
-      ws.onclose = () => {
+      watchWs.onclose = () => {
         status.textContent = "Reconnecting…";
         setTimeout(connectWatch, 1000);
       };
-      ws.onerror = () => ws.close();
-      ws.onmessage = (ev) => {
-        const blob = new Blob([ev.data], { type: "image/jpeg" });
-        const url = URL.createObjectURL(blob);
-        if (frameUrl) URL.revokeObjectURL(frameUrl);
-        frameUrl = url;
-        img.src = url;
-        frames++;
-        setFpsLabel("Live");
+      watchWs.onerror = () => watchWs.close();
+      watchWs.onmessage = (ev) => {
+        if (ev.data instanceof ArrayBuffer) latestJpeg = ev.data;
       };
     }
+    paintLoop();
     connectWatch();
+
+    const audioStart = document.getElementById("audioStart");
+    const audioMute = document.getElementById("audioMute");
+    const audioStatus = document.getElementById("audioStatus");
+    let audioCtx;
+    let audioGain;
+    let audioWorklet;
+    let listenWs;
+    let listenReconnectTimer;
+    let audioPackets = 0;
+    const workletURL = URL.createObjectURL(new Blob([`
+      class PCMPlayer extends AudioWorkletProcessor {
+        constructor() {
+          super();
+          this.inputRate = 16000;
+          this.ring = new Float32Array(16000);
+          this.write = 0;
+          this.readPos = 0;
+          this.count = 0;
+          this.frac = 0;
+          this.lastOut = 0;
+          this.minBuffer = 2400;
+          this.playing = false;
+          this.port.onmessage = (ev) => {
+            const buf = ev.data;
+            if (!(buf instanceof ArrayBuffer) || buf.byteLength < 6) return;
+            const view = new DataView(buf);
+            if (view.getUint8(0) !== 0xa1) return;
+            const rate = view.getUint16(2, true);
+            if (rate > 0) this.inputRate = rate;
+            const pcmBytes = view.getUint16(4, true);
+            if (pcmBytes < 2 || 6 + pcmBytes > buf.byteLength) return;
+            const samples = new Int16Array(buf, 6, pcmBytes >> 1);
+            const need = samples.length;
+            if (this.count + need > this.ring.length) {
+              const drop = Math.max(need, this.ring.length >> 2);
+              this.readPos = (this.readPos + drop) % this.ring.length;
+              this.count = Math.max(0, this.count - drop);
+              this.playing = false;
+            }
+            for (let i = 0; i < samples.length; i++) {
+              this.ring[this.write] = samples[i] / 32768;
+              this.write = (this.write + 1) % this.ring.length;
+              this.count++;
+            }
+          };
+        }
+        process(inputs, outputs) {
+          const out = outputs[0][0];
+          if (!out) return true;
+          const step = this.inputRate / sampleRate;
+          for (let i = 0; i < out.length; i++) {
+            if (!this.playing) {
+              if (this.count < this.minBuffer) {
+                out[i] = 0;
+                continue;
+              }
+              this.playing = true;
+            }
+            if (this.count <= 1) {
+              out[i] = this.lastOut * 0.995;
+              this.lastOut = out[i];
+              continue;
+            }
+            const i0 = this.readPos;
+            const i1 = (this.readPos + 1) % this.ring.length;
+            const s0 = this.ring[i0];
+            const s1 = this.ring[i1];
+            out[i] = s0 + (s1 - s0) * this.frac;
+            this.lastOut = out[i];
+            this.frac += step;
+            while (this.frac >= 1 && this.count > 1) {
+              this.frac -= 1;
+              this.readPos = (this.readPos + 1) % this.ring.length;
+              this.count--;
+            }
+          }
+          return true;
+        }
+      }
+      registerProcessor("pcm-player", PCMPlayer);
+    `], { type: "application/javascript" }));
+
+    async function startAudio() {
+      if (audioCtx) return;
+      audioCtx = new AudioContext();
+      await audioCtx.audioWorklet.addModule(workletURL);
+      audioWorklet = new AudioWorkletNode(audioCtx, "pcm-player", {
+        outputChannelCount: [1],
+      });
+      audioGain = audioCtx.createGain();
+      audioWorklet.connect(audioGain);
+      audioGain.connect(audioCtx.destination);
+      audioGain.gain.value = audioMute.checked ? 0 : 1;
+      await audioCtx.resume();
+      connectListen();
+      audioStart.disabled = true;
+      audioStatus.textContent = "Audio connecting…";
+    }
+
+    function connectListen() {
+      if (listenReconnectTimer) {
+        clearTimeout(listenReconnectTimer);
+        listenReconnectTimer = null;
+      }
+      if (listenWs) {
+        listenWs.onclose = null;
+        listenWs.close();
+      }
+      const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+      listenWs = new WebSocket(scheme + "//" + location.host + "/listen");
+      listenWs.binaryType = "arraybuffer";
+      listenWs.onopen = () => {
+        audioPackets = 0;
+        audioStatus.textContent = audioMute.checked ? "Audio muted" : "Audio live";
+      };
+      listenWs.onclose = () => {
+        audioStatus.textContent = "Audio reconnecting…";
+        listenReconnectTimer = setTimeout(connectListen, 1000);
+      };
+      listenWs.onerror = () => listenWs.close();
+      listenWs.onmessage = (ev) => {
+        if (!audioWorklet || !(ev.data instanceof ArrayBuffer)) return;
+        audioWorklet.port.postMessage(ev.data, [ev.data]);
+        audioPackets++;
+        if (audioPackets % 50 === 0 && audioCtx) {
+          audioStatus.textContent = (audioMute.checked ? "Audio muted · " : "Audio live · ")
+            + audioPackets + " pkts";
+        }
+      };
+    }
+
+    audioStart.addEventListener("click", () => {
+      startAudio().catch((e) => {
+        console.warn("audio start failed", e);
+        audioStatus.textContent = "Audio failed (try Chrome/Edge)";
+        audioStart.disabled = false;
+      });
+    });
+    audioMute.addEventListener("change", () => {
+      if (audioGain) audioGain.gain.value = audioMute.checked ? 0 : 1;
+      if (audioCtx) {
+        audioStatus.textContent = audioMute.checked ? "Audio muted" : "Audio live";
+      }
+    });
 
     const quality = document.getElementById("quality");
     const qualityVal = document.getElementById("qualityVal");

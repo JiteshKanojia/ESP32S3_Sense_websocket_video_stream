@@ -14,6 +14,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"camserver/internal/audi"
 	"camserver/internal/auth"
 	"camserver/internal/cameractl"
 	"camserver/internal/config"
@@ -31,10 +32,11 @@ type pageData struct {
 }
 
 // New returns the HTTP handler for login, viewing, and camera ingest.
-func New(cfg config.Config, h *hub.Hub) http.Handler {
+func New(cfg config.Config, h *hub.Hub, audio *audi.Hub) http.Handler {
 	s := &app{
 		cfg:    cfg,
 		hub:    h,
+		audio:  audio,
 		camera: cameractl.New(),
 		limit:  auth.NewLimiter(loginAttempts, time.Minute),
 		tmpl:   template.Must(template.New("page").Parse(pageHTML)),
@@ -45,6 +47,7 @@ func New(cfg config.Config, h *hub.Hub) http.Handler {
 	mux.HandleFunc("POST /logout", s.logout)
 	mux.HandleFunc("GET /frame", s.frame)
 	mux.HandleFunc("GET /watch", s.watchWS)
+	mux.HandleFunc("GET /listen", s.listenWS)
 	mux.HandleFunc("GET /camera/settings", s.cameraSettingsGet)
 	mux.HandleFunc("PATCH /camera/settings", s.cameraSettingsPatch)
 	mux.HandleFunc("POST /ingest", s.ingest)
@@ -55,6 +58,7 @@ func New(cfg config.Config, h *hub.Hub) http.Handler {
 type app struct {
 	cfg          config.Config
 	hub          *hub.Hub
+	audio        *audi.Hub
 	camera       *cameractl.Camera
 	limit        *auth.Limiter
 	tmpl         *template.Template
@@ -134,6 +138,61 @@ func (s *app) ingest(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logIngest("ingest frame %d bytes", len(data))
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *app) listenWS(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	conn, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	ctx := r.Context()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			if _, _, err := conn.Read(ctx); err != nil {
+				return
+			}
+		}
+	}()
+
+	ch := s.audio.Subscribe()
+	defer s.audio.Unsubscribe(ch)
+
+	if frame := s.audio.Latest(); frame != nil {
+		if err := conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
+			return
+		}
+	}
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		case frame := <-ch:
+			for {
+				if err := conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
+					return
+				}
+				select {
+				case frame = <-ch:
+				default:
+					frame = nil
+				}
+				if frame == nil {
+					break
+				}
+			}
+		}
+	}
 }
 
 func (s *app) watchWS(w http.ResponseWriter, r *http.Request) {
@@ -233,10 +292,18 @@ func (s *app) ingestWS(w http.ResponseWriter, r *http.Request) {
 		if len(data) > hub.MaxFrameBytes {
 			continue
 		}
-		if err := s.hub.Publish(data); err != nil {
+		if hub.ValidJPEG(data) {
+			if err := s.hub.Publish(data); err != nil {
+				continue
+			}
+			s.logIngest("ingest frame %d bytes", len(data))
 			continue
 		}
-		s.logIngest("ingest frame %d bytes", len(data))
+		if audi.ValidFrame(data) {
+			if err := s.audio.Publish(data); err != nil {
+				continue
+			}
+		}
 	}
 }
 

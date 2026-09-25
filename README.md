@@ -22,9 +22,9 @@ go test ./...
 go run ./cmd/server
 ```
 
-Open `http://127.0.0.1:8080`, log in, and the page streams over **`/watch`** (WebSocket). `GET /frame` remains for simple HTTP clients.
+Open `http://127.0.0.1:8080`, log in, and the page streams video over **`/watch`** (WebSocket) and audio over **`/listen`** (click **Enable audio**). `GET /frame` remains for simple HTTP clients.
 
-The camera pushes JPEGs over **WebSocket** (`GET /ingest`, binary frames, `X-API-Key` header). **HTTP POST** to `/ingest` still works for `fakecam`. `-url` defaults to `http://127.0.0.1:8080/ingest`.
+The camera pushes **JPEG** and **PCM16** frames on one **WebSocket** (`GET /ingest`, binary messages, `X-API-Key` header). JPEG messages start with `FF D8`; audio uses magic `0xA1` (see below). **HTTP POST** to `/ingest` still works for `fakecam` (JPEG only). `-url` defaults to `http://127.0.0.1:8080/ingest`.
 
 ```powershell
 go run ./cmd/fakecam -file C:\path\to\frame.jpg
@@ -34,10 +34,11 @@ go run ./cmd/fakecam -file C:\path\to\frame.jpg
 | --- | --- | --- |
 | `GET /` | browser | session cookie after `POST /login` |
 | `GET /watch` | browser (WebSocket, binary JPEG) | session cookie on handshake |
+| `GET /listen` | browser (WebSocket, binary PCM frames) | session cookie on handshake |
 | `GET /frame` | tools (single JPEG snapshot) | same cookie |
 | `GET /camera/settings` | browser (JSON snapshot) | session cookie |
 | `PATCH /camera/settings` | browser (partial JSON) | session cookie; server pushes text JSON to camera over ingest WS |
-| `GET /ingest` | camera (WebSocket, binary JPEG) | `X-API-Key` on handshake |
+| `GET /ingest` | camera (WebSocket, JPEG + audio binary) | `X-API-Key` on handshake |
 | `POST /ingest` | fakecam / tools (`image/jpeg` body) | `X-API-Key` header |
 
 The session cookie is marked `Secure` when the request is HTTPS (e.g. `X-Forwarded-Proto: https` behind a reverse proxy). Login failures are limited to 8 per client IP per minute.
@@ -70,7 +71,17 @@ The sketch streams **1024×768 (XGA)** JPEGs over **WebSocket** (`ws://HOST:PORT
 
 **Arduino Tools (XIAO ESP32S3 Sense):** set **PSRAM** to **OPI PSRAM**. Camera init runs **before Wi-Fi** on XIAO (malloc requirement).
 
+**Serial logging:** messages use ESP-IDF `esp_log` via `cam_log.h`. Boot/Wi‑Fi/ingest events use `CAM_LOGI`; anything from `loop()` uses `CAM_LOG_LOOP_*` and is **off by default** (`CAM_LOOP_LOG 0`) so fps lines do not block streaming audio. Set `CAM_LOOP_LOG 1` in `config.h` when debugging fps.
+
 Allow inbound TCP **8080** on the machine running the server if the firewall blocks LAN clients.
+
+### Audio (PDM mic)
+
+The **Sense expansion board** onboard PDM mic uses **GPIO42 = CLK** and **GPIO41 = DATA** ([Seeed mic wiki](https://wiki.seeedstudio.com/xiao_esp32s3_sense_mic/)); the sketch calls `setPinsPdmRx(42, 41)` after Wi‑Fi comes up. Serial should show `audio: PDM 16000 Hz mono` and `audio pkt/s ~40–50` when ingest is connected.
+
+The mic sends **PCM 16-bit mono @ 16 kHz** in ~20 ms chunks (~32 KB/s). Wire format per message: `0xA1`, format `0x01`, sample rate (LE `uint16`), payload length (LE `uint16`), then PCM bytes. Set **`CAM_AUDIO_ENABLE`** to `0` in `config.h` to disable mic capture and compare video fps. If samples are stuck, try a full flash erase (known ESP32 Arduino 3.x quirk).
+
+With audio enabled, capture runs on a **separate FreeRTOS task**; expect about **0–2 fps** video drop on LAN versus audio off, mainly from extra Wi-Fi packets—not from JPEG size.
 
 ### Frame rate (theory vs this project)
 

@@ -24,3 +24,19 @@
 // Boot orientation (also adjustable in the viewer). 0 or 1.
 // #define CAM_VFLIP 0
 // #define CAM_HMIRROR 0
+
+// Onboard PDM mic → PCM16 @ 16 kHz on ingest WebSocket (0 to disable and A/B video fps).
+#ifndef CAM_AUDIO_ENABLE
+#define CAM_AUDIO_ENABLE 1
+#endif
+
+// Logging via esp_log (still USB serial). ESP_LOG_INFO, ESP_LOG_WARN, ESP_LOG_DEBUG, ESP_LOG_NONE
+// #define CAM_LOG_LEVEL ESP_LOG_INFO
+
+// Loop logging: fps stats and logs from loop() (settings applied, etc.). 0 = off — recommended for audio.
+#ifndef CAM_LOOP_LOG
+#define CAM_LOOP_LOG 0
+#endif
+
+// When CAM_LOOP_LOG is 1, periodic fps line interval in ms (0 = no fps line only).
+// #define CAM_STATS_INTERVAL_MS 2000

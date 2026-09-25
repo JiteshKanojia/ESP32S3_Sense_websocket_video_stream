@@ -4,6 +4,18 @@
 #include <esp_heap_caps.h>
 #include "config.h"
 #include "camera_pins.h"
+#include "cam_log.h"
+
+#ifndef CAM_AUDIO_ENABLE
+#define CAM_AUDIO_ENABLE 1
+#endif
+
+#if CAM_AUDIO_ENABLE
+#include "ESP_I2S.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+#endif
 
 #ifndef CAM_ANTIBANDING_HZ
 #define CAM_ANTIBANDING_HZ 50
@@ -44,6 +56,117 @@ char apiKeyHeader[96];
 uint8_t *sendBuf = nullptr;
 size_t sendBufCap = 0;
 
+#if CAM_AUDIO_ENABLE
+static const int kAudioSampleRate = 16000;
+static const size_t kAudioPcmBytes = 640;
+static const size_t kAudioHeaderBytes = 6;
+static const size_t kAudioPacketBytes = kAudioHeaderBytes + kAudioPcmBytes;
+// Seeed wiki: GPIO42 = PDM CLK, GPIO41 = PDM DATA → setPinsPdmRx(clk, data)
+static const int kPdmClkPin = 42;
+static const int kPdmDataPin = 41;
+
+static I2SClass audioI2s;
+static QueueHandle_t audioQueue = nullptr;
+static volatile bool audioReady = false;
+static uint32_t audioPacketsSent = 0;
+
+static void packAudioFrame(uint8_t *out, const uint8_t *pcm, size_t pcmLen) {
+  out[0] = 0xA1;
+  out[1] = 0x01;
+  out[2] = (uint8_t)(kAudioSampleRate & 0xFF);
+  out[3] = (uint8_t)((kAudioSampleRate >> 8) & 0xFF);
+  out[4] = (uint8_t)(pcmLen & 0xFF);
+  out[5] = (uint8_t)((pcmLen >> 8) & 0xFF);
+  memcpy(out + kAudioHeaderBytes, pcm, pcmLen);
+}
+
+static bool readPcmBlock(uint8_t *pcm, size_t bytes) {
+  int16_t *samples = (int16_t *)pcm;
+  const size_t needSamples = bytes / 2;
+  size_t gotSamples = 0;
+  uint32_t idle = 0;
+  while (gotSamples < needSamples) {
+    int sample = audioI2s.read();
+    if (sample == -1 || sample == 1) {
+      if (++idle > 2000) {
+        return false;
+      }
+      vTaskDelay(1);
+      continue;
+    }
+    idle = 0;
+    samples[gotSamples++] = (int16_t)sample;
+  }
+  return gotSamples == needSamples;
+}
+
+static void audioTask(void *arg) {
+  uint8_t pcm[kAudioPcmBytes];
+  uint8_t packet[kAudioPacketBytes];
+  for (;;) {
+    if (!readPcmBlock(pcm, kAudioPcmBytes)) {
+      vTaskDelay(10);
+      continue;
+    }
+    packAudioFrame(packet, pcm, kAudioPcmBytes);
+    if (xQueueSend(audioQueue, packet, 0) != pdTRUE) {
+      uint8_t drop[kAudioPacketBytes];
+      xQueueReceive(audioQueue, drop, 0);
+      xQueueSend(audioQueue, packet, 0);
+    }
+  }
+}
+
+static bool initAudio() {
+  audioI2s.setPinsPdmRx(kPdmClkPin, kPdmDataPin);
+  if (!audioI2s.begin(I2S_MODE_PDM_RX, kAudioSampleRate, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
+    CAM_LOGE("audio: PDM init failed (Sense hat? pins 42=CLK 41=DATA)");
+    return false;
+  }
+  delay(50);
+  audioQueue = xQueueCreate(3, kAudioPacketBytes);
+  if (!audioQueue) {
+    CAM_LOGE("audio: queue alloc failed");
+    return false;
+  }
+  if (xTaskCreatePinnedToCore(audioTask, "audio", 4096, nullptr, 1, nullptr, 0) != pdPASS) {
+    CAM_LOGE("audio: task create failed");
+    return false;
+  }
+  audioReady = true;
+  CAM_LOGI("audio: PDM %d Hz mono (CLK=%d DATA=%d)", kAudioSampleRate, kPdmClkPin, kPdmDataPin);
+  return true;
+}
+
+static void flushAudioQueue() {
+  if (!audioQueue) {
+    return;
+  }
+  uint8_t drop[kAudioPacketBytes];
+  while (xQueueReceive(audioQueue, drop, 0) == pdTRUE) {
+  }
+}
+
+static bool sendOneAudioPacket() {
+  if (!audioReady || !audioQueue || !ingestConnected) {
+    return false;
+  }
+  uint8_t packet[kAudioPacketBytes];
+  if (xQueueReceive(audioQueue, packet, 0) != pdTRUE) {
+    return false;
+  }
+  uint16_t pcmLen = (uint16_t)packet[4] | ((uint16_t)packet[5] << 8);
+  size_t total = kAudioHeaderBytes + pcmLen;
+  if (!webSocket.sendBIN(packet, total)) {
+    return false;
+  }
+#if CAM_LOOP_LOG
+  audioPacketsSent++;
+#endif
+  return true;
+}
+#endif
+
 // OV3660 anti-flicker (50/60 Hz mains). AEC can overwrite band registers — re-apply in loop.
 static void applyAntibanding(sensor_t *sensor, int hz, bool log) {
   if (!sensor || !sensor->set_reg || hz == 0) {
@@ -51,7 +174,7 @@ static void applyAntibanding(sensor_t *sensor, int hz, bool log) {
   }
   if (sensor->id.PID != OV3660_PID) {
     if (log) {
-      Serial.println("antibanding: skipped (not OV3660)");
+      CAM_LOGD("antibanding: skipped (not OV3660)");
     }
     return;
   }
@@ -75,7 +198,7 @@ static void applyAntibanding(sensor_t *sensor, int hz, bool log) {
     sensor->set_reg(sensor, 0x3a14, 0xff, 0x09);
     sensor->set_reg(sensor, 0x3a15, 0xff, 0x30);
     if (log) {
-      Serial.println("antibanding 50Hz");
+      CAM_LOGD("antibanding 50Hz");
     }
   } else if (hz == 60) {
     sensor->set_reg(sensor, 0x3c01, 0xff, 0x82);
@@ -83,7 +206,7 @@ static void applyAntibanding(sensor_t *sensor, int hz, bool log) {
     sensor->set_reg(sensor, 0x3a0b, 0xff, 0x52);
     sensor->set_reg(sensor, 0x3a0d, 0xff, 0x09);
     if (log) {
-      Serial.println("antibanding 60Hz");
+      CAM_LOGD("antibanding 60Hz");
     }
   }
 
@@ -186,7 +309,7 @@ static void applySettingsFromJson(const char *json) {
     runtimeHmirror = v;
   }
   applyOrientation(sensor);
-  Serial.println("camera settings applied");
+  CAM_LOG_LOOP_D("camera settings applied");
 }
 
 bool initCamera() {
@@ -219,16 +342,16 @@ bool initCamera() {
 
   if (psramFound()) {
     config.fb_location = CAMERA_FB_IN_PSRAM;
-    Serial.printf("camera: PSRAM free=%u\n", (unsigned)ESP.getFreePsram());
+    CAM_LOGI("camera: PSRAM free=%u", (unsigned)ESP.getFreePsram());
   } else {
-    Serial.println("camera: enable OPI PSRAM in Arduino Tools");
+    CAM_LOGW("camera: enable OPI PSRAM in Arduino Tools");
     config.fb_location = CAMERA_FB_IN_DRAM;
     config.fb_count = 1;
     config.jpeg_buffer_size = 64 * 1024;
   }
 
   if (esp_camera_init(&config) != ESP_OK) {
-    Serial.printf("camera init failed, psram=%u\n", (unsigned)ESP.getFreePsram());
+    CAM_LOGE("camera init failed, psram=%u", (unsigned)ESP.getFreePsram());
     return false;
   }
 
@@ -238,9 +361,7 @@ bool initCamera() {
   sensor_t *sensor = esp_camera_sensor_get();
   if (sensor) {
     sensor->set_quality(sensor, kJpegQuality);
-    Serial.printf(
-        "camera sensor PID=0x%04x (OV3660=0x3660)\n",
-        (unsigned)sensor->id.PID);
+    CAM_LOGI("camera sensor PID=0x%04x (OV3660=0x3660)", (unsigned)sensor->id.PID);
     applyImageTuning(sensor);
     applyOrientation(sensor);
     applyAntibanding(sensor, runtimeAntibanding, true);
@@ -252,12 +373,12 @@ bool initCamera() {
     sendBuf = (uint8_t *)malloc(sendBufCap);
   }
   if (!sendBuf) {
-    Serial.println("send buffer alloc failed");
+    CAM_LOGE("send buffer alloc failed");
     return false;
   }
 
   cameraReady = true;
-  Serial.println("camera ready 1024x768");
+  CAM_LOGI("camera ready 1024x768");
   return true;
 }
 
@@ -267,28 +388,24 @@ void connectWiFi() {
   WiFi.setAutoReconnect(true);
   WiFi.setTxPower(CAM_WIFI_TX_POWER);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("wifi");
-  uint32_t lastDot = millis();
   while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - lastDot >= 500) {
-      Serial.print(".");
-      lastDot = millis();
-    }
     delay(10);
   }
-  Serial.println();
-  Serial.println(WiFi.localIP());
+  CAM_LOGI("wifi %s", WiFi.localIP().toString().c_str());
 }
 
 void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
   switch (type) {
   case WStype_DISCONNECTED:
     ingestConnected = false;
-    Serial.println("ingest disconnected");
+#if CAM_AUDIO_ENABLE
+    flushAudioQueue();
+#endif
+    CAM_LOGI("ingest disconnected");
     break;
   case WStype_CONNECTED:
     ingestConnected = true;
-    Serial.println("ingest connected");
+    CAM_LOGI("ingest connected");
     break;
   case WStype_TEXT:
     if (length >= sizeof(settingsJson)) {
@@ -316,13 +433,18 @@ void connectIngest() {
 }
 
 void setup() {
-  Serial.begin(115200);
+  camLogInit(115200);
   delay(500);
 
   if (!initCamera()) {
-    Serial.println("camera init failed; check OPI PSRAM in Tools");
+    CAM_LOGE("camera init failed; check OPI PSRAM in Tools");
   }
   connectWiFi();
+#if CAM_AUDIO_ENABLE
+  if (!initAudio()) {
+    CAM_LOGW("audio disabled (init failed)");
+  }
+#endif
   connectIngest();
 
   camera_fb_t *warm = esp_camera_fb_get();
@@ -331,9 +453,9 @@ void setup() {
   }
 
 #if CAM_USE_TLS
-  Serial.printf("wss://%s%s\n", CAM_HOST, CAM_PATH);
+  CAM_LOGI("wss://%s%s", CAM_HOST, CAM_PATH);
 #else
-  Serial.printf("ws://%s:%d%s\n", CAM_HOST, CAM_PORT, CAM_PATH);
+  CAM_LOGI("ws://%s:%d%s", CAM_HOST, CAM_PORT, CAM_PATH);
 #endif
 }
 
@@ -359,6 +481,17 @@ static void jpegView(const uint8_t *buf, size_t len, const uint8_t **out, size_t
   }
 }
 
+#if CAM_AUDIO_ENABLE
+static void pumpAudioOut(int maxPackets) {
+  for (int i = 0; i < maxPackets && ingestConnected; i++) {
+    if (!sendOneAudioPacket()) {
+      break;
+    }
+    webSocket.loop();
+  }
+}
+#endif
+
 void loop() {
   webSocket.loop();
 
@@ -367,6 +500,11 @@ void loop() {
     delay(200);
     return;
   }
+
+#if CAM_AUDIO_ENABLE
+  pumpAudioOut(8);
+#endif
+
   if (!cameraReady || !ingestConnected || !sendBuf) {
     return;
   }
@@ -390,7 +528,7 @@ void loop() {
   jpegView(fb->buf, fb->len, &jpeg, &frameLen);
   if (frameLen > sendBufCap) {
     esp_camera_fb_return(fb);
-    Serial.println("frame larger than send buffer");
+    CAM_LOG_LOOP_W("frame larger than send buffer");
     return;
   }
   memcpy(sendBuf, jpeg, frameLen);
@@ -400,15 +538,35 @@ void loop() {
     return;
   }
 
-  static uint32_t lastLog = 0;
-  static uint32_t framesSinceLog = 0;
+#if CAM_AUDIO_ENABLE
+  pumpAudioOut(12);
+#endif
+
+#if CAM_LOOP_LOG
+  static uint32_t statsSinceMs = 0;
+  static uint32_t framesSinceStats = 0;
   static size_t lastBytes = 0;
-  framesSinceLog++;
+  framesSinceStats++;
   lastBytes = frameLen;
-  if (millis() - lastLog >= 2000) {
-    float fps = framesSinceLog * 1000.0f / (millis() - lastLog);
-    Serial.printf("%.1f fps, %u KB/frame (q=%d)\n", fps, (unsigned)(lastBytes / 1024), runtimeQuality);
-    lastLog = millis();
-    framesSinceLog = 0;
+  uint32_t elapsed = millis() - statsSinceMs;
+  if (statsSinceMs == 0) {
+    statsSinceMs = millis();
   }
+  if (elapsed >= (uint32_t)CAM_STATS_INTERVAL_MS) {
+    float fps = framesSinceStats * 1000.0f / (float)elapsed;
+#if CAM_AUDIO_ENABLE
+    pumpAudioOut(4);
+    int audioPs = (int)(audioPacketsSent * 1000 / (elapsed ? elapsed : 1));
+    audioPacketsSent = 0;
+#else
+    int audioPs = -1;
+#endif
+    camLogStreamStats(fps, lastBytes / 1024, runtimeQuality, audioPs);
+#if CAM_AUDIO_ENABLE
+    pumpAudioOut(4);
+#endif
+    framesSinceStats = 0;
+    statsSinceMs = millis();
+  }
+#endif
 }

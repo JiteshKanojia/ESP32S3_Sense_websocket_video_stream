@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"camserver/internal/audi"
 	"camserver/internal/config"
 	"camserver/internal/hub"
 	"camserver/internal/server"
@@ -17,7 +18,7 @@ func main() {
 	}
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           server.New(cfg, hub.New()),
+		Handler:           server.New(cfg, hub.New(), audi.New()),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	log.Printf("listening on %s", cfg.ListenAddr)
